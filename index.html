@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firestore live demo</title>
+<style>
+:root{--bg:#f3f5f7;--card:#fff;--text:#18222e;--muted:#5b6978;--line:#d9e0e7;--accent:#0b6b5c;--flash:#ffe9a8;--err:#b3261e;--ok:#1b7a43}
+@media (prefers-color-scheme:dark){:root{--bg:#10151b;--card:#18202a;--text:#e9eef3;--muted:#92a1b1;--line:#2b3644;--accent:#5fd1b8;--flash:#5a4a10;--err:#ff8f86;--ok:#79d49a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 Georgia,"Times New Roman",serif;display:flex;justify-content:center;padding:32px 16px}
+main{width:100%;max-width:520px}
+h1{font-size:1.25rem;margin:0 0 4px;font-weight:700}
+.sub{margin:0 0 20px;color:var(--muted);font-family:system-ui,sans-serif;font-size:.9rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:24px}
+.hidden{display:none}
+label{display:block;font-family:system-ui,sans-serif;font-size:.9rem;margin-bottom:8px}
+textarea{width:100%;height:170px;font:13px/1.4 ui-monospace,Consolas,monospace;padding:10px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--text)}
+button{margin-top:12px;padding:9px 18px;font:600 .9rem system-ui,sans-serif;border:0;border-radius:4px;background:var(--accent);color:var(--card);cursor:pointer}
+button.link{background:none;color:var(--muted);text-decoration:underline;padding:0;margin:0;font-weight:400}
+button:focus-visible,textarea:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.name{font-size:2rem;font-weight:700;margin:0 0 12px}
+.row{font-size:1.4rem;margin:4px 0;padding:2px 8px;margin-left:-8px;border-radius:4px}
+.row span{color:var(--muted);font-size:1rem;font-family:system-ui,sans-serif}
+.flash{animation:flash 2.5s ease-out}
+@keyframes flash{from{background:var(--flash)}to{background:transparent}}
+@media (prefers-reduced-motion:reduce){.flash{animation:none;background:var(--flash)}}
+.status{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);font:.85rem/1.5 system-ui,sans-serif;color:var(--muted)}
+.status b{color:var(--ok)}
+.msg{font:.95rem/1.5 system-ui,sans-serif;color:var(--err);margin:12px 0 0}
+</style>
+</head>
+<body>
+<main>
+  <h1>Firestore live demo</h1>
+  <p class="sub">Watches <code>products / mouse001</code> in your own Firebase project.</p>
+
+  <section id="setup" class="card hidden">
+    <label for="cfg">Paste your <code>firebaseConfig</code> block from Firebase Project settings:</label>
+    <textarea id="cfg" spellcheck="false" placeholder='const firebaseConfig = {
+  apiKey: "...",
+  authDomain: "...",
+  projectId: "...",
+  storageBucket: "...",
+  messagingSenderId: "...",
+  appId: "..."
+};'></textarea>
+    <button id="connect">Connect</button>
+    <p id="setupMsg" class="msg" role="alert"></p>
+  </section>
+
+  <section id="live" class="card hidden" aria-live="polite">
+    <p class="name" id="pName">Loading…</p>
+    <p class="row" id="rPrice"><span>Price:</span> <strong id="pPrice">–</strong></p>
+    <p class="row" id="rStock"><span>In stock:</span> <strong id="pStock">–</strong></p>
+    <p id="liveMsg" class="msg" role="alert"></p>
+    <div class="status">
+      <div id="sAuth">Signing in…</div>
+      <div id="sListen"></div>
+      <div id="sTime"></div>
+      <p style="margin:10px 0 0"><button class="link" id="reset">Use a different project</button></p>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const KEY = "firestoreDemoConfig";
+let unsubscribe = null, lastPrice, lastStock;
+
+function parseConfig(text){
+  const get = k => (text.match(new RegExp(k + '["\']?\\s*:\\s*["\']([^"\']+)["\']')) || [])[1];
+  const c = { apiKey:get("apiKey"), projectId:get("projectId"), appId:get("appId") };
+  c.authDomain = get("authDomain") || (c.projectId ? c.projectId + ".firebaseapp.com" : undefined);
+  return c;
+}
+
+function show(which){
+  $("setup").classList.toggle("hidden", which !== "setup");
+  $("live").classList.toggle("hidden", which !== "live");
+}
+
+function flash(el){
+  el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
+}
+
+async function start(cfg){
+  show("live");
+  $("liveMsg").textContent = "";
+  $("pName").textContent = "Loading…";
+  $("pPrice").textContent = "–"; $("pStock").textContent = "–";
+  $("sAuth").textContent = "Signing in…"; $("sListen").textContent = ""; $("sTime").textContent = "";
+  lastPrice = lastStock = undefined;
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+
+  let sdk;
+  try {
+    const base = "https://www.gstatic.com/firebasejs/10.14.1/";
+    const [a, au, fs] = await Promise.all([
+      import(base + "firebase-app.js"),
+      import(base + "firebase-auth.js"),
+      import(base + "firebase-firestore.js")
+    ]);
+    sdk = { a, au, fs };
+  } catch (e) {
+    $("liveMsg").textContent = "Could not load Firebase. Check your internet connection and try again.";
+    return;
+  }
+
+  const app = sdk.a.initializeApp(cfg, "demo" + Date.now());
+  try {
+    await sdk.au.signInAnonymously(sdk.au.getAuth(app));
+    $("sAuth").innerHTML = "<b>Signed in anonymously</b>";
+  } catch (e) {
+    $("sAuth").textContent = "Sign-in failed";
+    $("liveMsg").textContent = "Anonymous sign-in failed (" + (e.code || e.message) + "). Check that Anonymous is Enabled in Authentication > Sign-in method, and that your apiKey was pasted correctly.";
+    return;
+  }
+
+  const db = sdk.fs.getFirestore(app);
+  $("sListen").innerHTML = "<b>Listening</b> to products / mouse001 with onSnapshot()";
+
+  unsubscribe = sdk.fs.onSnapshot(sdk.fs.doc(db, "products", "mouse001"), snap => {
+    $("liveMsg").textContent = "";
+    if (!snap.exists()) {
+      $("pName").textContent = "Document not found";
+      $("pPrice").textContent = "–"; $("pStock").textContent = "–";
+      $("liveMsg").textContent = "No document at products / mouse001. Check the collection name (products) and document ID (mouse001) are spelled exactly.";
+      return;
+    }
+    const d = snap.data();
+    $("pName").textContent = d.name ?? "(no name field)";
+    $("pPrice").textContent = d.price ?? "(no price field)";
+    if (typeof d.inStock === "boolean") {
+      $("pStock").textContent = d.inStock ? "Yes" : "No";
+    } else {
+      $("pStock").textContent = "–";
+      $("liveMsg").textContent = "Field inStock is missing or is not a boolean. Field names are case sensitive: use inStock with a capital S, type boolean.";
+    }
+    if (lastPrice !== undefined && d.price !== lastPrice) flash($("rPrice"));
+    if (lastStock !== undefined && d.inStock !== lastStock) flash($("rStock"));
+    lastPrice = d.price; lastStock = d.inStock;
+    $("sTime").textContent = "Last update received: " + new Date().toLocaleTimeString();
+  }, err => {
+    $("pName").textContent = "Cannot read data";
+    $("liveMsg").textContent = err.code === "permission-denied"
+      ? "Permission denied. Check that the Part G rules are published exactly as given, and that Anonymous sign-in is enabled (Part F)."
+      : "Error: " + (err.code || err.message);
+  });
+}
+
+$("connect").addEventListener("click", () => {
+  const cfg = parseConfig($("cfg").value);
+  if (!cfg.apiKey || !cfg.projectId || !cfg.appId) {
+    $("setupMsg").textContent = "Could not find apiKey, projectId and appId. Paste the whole firebaseConfig block, including those three lines.";
+    return;
+  }
+  $("setupMsg").textContent = "";
+  try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (e) {}
+  start(cfg);
+});
+
+$("reset").addEventListener("click", () => {
+  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  try { localStorage.removeItem(KEY); } catch (e) {}
+  show("setup");
+});
+
+let saved = null;
+try { saved = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) {}
+if (saved && saved.apiKey && saved.projectId && saved.appId) start(saved); else show("setup");
+</script>
+</body>
+</html>
